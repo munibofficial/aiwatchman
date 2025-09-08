@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+import time
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import numpy as np
@@ -10,8 +11,6 @@ from flask_cors import CORS
 
 from model import db, User, FaceEmbedding, DetectedFace, OtpCode
 from email_utils import init_mail, send_otp_email, verify_otp
-from flask_cors import CORS
-
 
 # -----------------------------
 # Flask app & basic config
@@ -19,7 +18,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-# Storage dirs (Heroku FS is ephemeral but writable)
+# Storage dirs
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 QUERY_DIR = os.path.join(BASE_DIR, "queries")
@@ -28,10 +27,9 @@ os.makedirs(QUERY_DIR, exist_ok=True)
 
 
 # -----------------------------
-# Database (use Heroku DATABASE_URL if present)
+# Database
 # -----------------------------
 def ensure_sslmode_require(url: str) -> str:
-    """Force sslmode=require for Postgres connections unless explicitly set."""
     parsed = urlparse(url)
     q = dict(parse_qsl(parsed.query))
     if parsed.scheme.startswith("postgres") and q.get("sslmode") is None:
@@ -43,10 +41,8 @@ def ensure_sslmode_require(url: str) -> str:
 
 db_url = os.getenv("DATABASE_URL")
 if db_url:
-    # Heroku can provide postgres:// – SQLAlchemy prefers postgresql://
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 else:
-    # Optional local fallback via individual envs
     DB_USER = os.getenv("DB_USER", "")
     DB_PASSWORD = os.getenv("DB_PASSWORD", "")
     DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -57,22 +53,17 @@ else:
 db_url = ensure_sslmode_require(db_url)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-# Keep connections fresh across dyno sleeps
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
 
-# Mail (reads env: MAIL_SERVER, MAIL_PORT, MAIL_USE_TLS/SSL, MAIL_USERNAME, MAIL_PASSWORD, MAIL_DEFAULT_SENDER)
 init_mail(app)
 
-# Bind db and create tables
 db.init_app(app)
 with app.app_context():
     db.create_all()
 
-
 # -----------------------------
-# InsightFace lazy loader (avoids Heroku boot timeouts)
+# InsightFace lazy loader
 # -----------------------------
-# Cache models in a writable path; re-downloaded per dyno restart
 os.environ.setdefault("INSIGHTFACE_HOME", "/tmp/insightface")
 
 _face_app = None
@@ -80,21 +71,18 @@ _face_lock = threading.Lock()
 
 
 def get_face_app():
-    """Initialize InsightFace on first use (thread-safe)."""
     global _face_app
     if _face_app is None:
         with _face_lock:
             if _face_app is None:
-                from insightface.app import FaceAnalysis  # heavy import, do it lazily
+                from insightface.app import FaceAnalysis
                 fa = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-                # CPU, detector size; adjust if you need speed vs. accuracy
                 fa.prepare(ctx_id=0, det_size=(640, 640))
                 _face_app = fa
     return _face_app
 
 
 def get_embeddings_from_image(img_path: str):
-    """Return a list of L2-normalized face embeddings (float32 lists)."""
     img = cv2.imread(img_path)
     if img is None:
         return []
@@ -112,7 +100,6 @@ def health():
 
 @app.route("/warmup", methods=["GET"])
 def warmup():
-    """Trigger model init so subsequent requests are fast."""
     _ = get_face_app()
     return jsonify({"status": "ok", "message": "Model warmed"}), 200
 
@@ -133,11 +120,9 @@ def upload_references():
         save_path = os.path.join(UPLOAD_DIR, filename)
         file.save(save_path)
 
-        # Extract only the starting letters before any numbers/underscores
         base_name = os.path.splitext(filename)[0]
         m = re.match(r"[A-Za-z]+", base_name)
         if not m:
-            # Skip files without a clean person prefix
             continue
         person = m.group(0).lower()
 
@@ -148,6 +133,8 @@ def upload_references():
 
     db.session.commit()
     return jsonify({"message": f"Added {added} embeddings to DB"}), 200
+
+
 @app.route("/identify-image", methods=["POST"])
 def identify_image():
     if "file" not in request.files:
@@ -158,7 +145,6 @@ def identify_image():
     temp_path = os.path.join(QUERY_DIR, orig_filename)
     file.save(temp_path)
 
-    # Optional GPS
     latitude = request.form.get("latitude")
     longitude = request.form.get("longitude")
     try:
@@ -171,7 +157,6 @@ def identify_image():
     if not query_embeddings:
         return jsonify({"error": "No face detected in the image"}), 400
 
-    # Load all known embeddings
     all_embeddings = FaceEmbedding.query.all()
     results = []
     detected = None
@@ -182,22 +167,27 @@ def identify_image():
 
         for entry in all_embeddings:
             db_emb = np.array(entry.embedding, dtype=np.float32)
-            score = float(np.dot(emb_np, db_emb))  # cosine similarity
+            score = float(np.dot(emb_np, db_emb))
             if score > best_score:
                 best_score = score
                 best_name = entry.person
 
-        # Threshold
         if best_score < 0.6:
             best_name = "unknown"
 
-        # If recognized, rename file with matched name
         if best_name != "unknown":
             new_filename = f"{best_name}_{orig_filename}"
         else:
             new_filename = f"unknown_{orig_filename}"
 
+        # ✅ Safe rename with timestamp if exists
+        base, ext = os.path.splitext(new_filename)
         save_path = os.path.join(QUERY_DIR, new_filename)
+        if os.path.exists(save_path):
+            timestamp = int(time.time())
+            new_filename = f"{base}_{timestamp}{ext}"
+            save_path = os.path.join(QUERY_DIR, new_filename)
+
         os.rename(temp_path, save_path)
 
         detected = DetectedFace(
@@ -315,9 +305,7 @@ def login():
 # -----------------------------
 # Entrypoint
 # -----------------------------
-
 if __name__ == "__main__":
-    # Heroku sets PORT; local default is 5000
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
