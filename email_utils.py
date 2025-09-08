@@ -1,7 +1,7 @@
 from flask_mail import Mail, Message
 from random import randint
 from datetime import datetime
-from model import db, OTP, User  # Make sure you have a User model
+from model import db, OtpCode, User
 import os
 from dotenv import load_dotenv
 
@@ -28,7 +28,7 @@ def send_otp_email(to_email):
     otp_code = str(randint(100000, 999999))
 
     # Save OTP to DB
-    otp_entry = OTP(email=to_email, otp=otp_code)
+    otp_entry = OtpCode(email=to_email, otp=otp_code)
     db.session.add(otp_entry)
     db.session.commit()
 
@@ -47,7 +47,7 @@ def send_otp_email(to_email):
 
 def verify_otp(to_email, otp_input):
     """Verify OTP from DB"""
-    otp_entry = OTP.query.filter_by(email=to_email, otp=otp_input).order_by(OTP.created_at.desc()).first()
+    otp_entry = OtpCode.query.filter_by(email=to_email, otp=otp_input).order_by(OtpCode.created_at.desc()).first()
     if otp_entry and otp_entry.expires_at > datetime.utcnow():
         # OTP is valid, delete after verification
         db.session.delete(otp_entry)
