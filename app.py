@@ -10,13 +10,14 @@ from flask_cors import CORS
 
 from model import db, User, FaceEmbedding, DetectedFace, OtpCode
 from email_utils import init_mail, send_otp_email, verify_otp
+from flask_cors import CORS
 
 
 # -----------------------------
 # Flask app & basic config
 # -----------------------------
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # Storage dirs (Heroku FS is ephemeral but writable)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,17 +148,15 @@ def upload_references():
 
     db.session.commit()
     return jsonify({"message": f"Added {added} embeddings to DB"}), 200
-
-
 @app.route("/identify-image", methods=["POST"])
 def identify_image():
     if "file" not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
 
     file = request.files["file"]
-    filename = file.filename or "query.jpg"
-    save_path = os.path.join(QUERY_DIR, filename)
-    file.save(save_path)
+    orig_filename = file.filename or "query.jpg"
+    temp_path = os.path.join(QUERY_DIR, orig_filename)
+    file.save(temp_path)
 
     # Optional GPS
     latitude = request.form.get("latitude")
@@ -168,13 +167,14 @@ def identify_image():
     except ValueError:
         latitude = longitude = None
 
-    query_embeddings = get_embeddings_from_image(save_path)
+    query_embeddings = get_embeddings_from_image(temp_path)
     if not query_embeddings:
         return jsonify({"error": "No face detected in the image"}), 400
 
     # Load all known embeddings
     all_embeddings = FaceEmbedding.query.all()
     results = []
+    detected = None
 
     for emb in query_embeddings:
         emb_np = np.array(emb, dtype=np.float32)
@@ -182,14 +182,23 @@ def identify_image():
 
         for entry in all_embeddings:
             db_emb = np.array(entry.embedding, dtype=np.float32)
-            score = float(np.dot(emb_np, db_emb))  # cosine since embeddings are normalized
+            score = float(np.dot(emb_np, db_emb))  # cosine similarity
             if score > best_score:
                 best_score = score
                 best_name = entry.person
 
-        # Threshold for recognition
+        # Threshold
         if best_score < 0.6:
             best_name = "unknown"
+
+        # If recognized, rename file with matched name
+        if best_name != "unknown":
+            new_filename = f"{best_name}_{orig_filename}"
+        else:
+            new_filename = f"unknown_{orig_filename}"
+
+        save_path = os.path.join(QUERY_DIR, new_filename)
+        os.rename(temp_path, save_path)
 
         detected = DetectedFace(
             person=best_name if best_name != "unknown" else None,
@@ -205,11 +214,11 @@ def identify_image():
 
     return jsonify(
         {
-            "filename": filename,
+            "filename": new_filename,
             "results": results,
             "latitude": latitude,
             "longitude": longitude,
-            "saved_id": detected.id,
+            "saved_id": detected.id if detected else None,
         }
     ), 200
 
