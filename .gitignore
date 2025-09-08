@@ -1,0 +1,48 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+*.dist-info/
+*.pytest_cache/
+*.mypy_cache/
+
+# Virtual environment
+venv/
+ENV/
+env/
+*.env
+
+# Flask stuff
+instance/
+*.sqlite3
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE/editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Uploaded images / queries (optional)
+uploads/
+queries/
+
+# PyInstaller
+dist/
+build/
+*.spec
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
