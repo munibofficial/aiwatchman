@@ -51,7 +51,7 @@ else:
     DB_HOST = os.getenv("DB_HOST", "localhost")
     DB_PORT = os.getenv("DB_PORT", "5432")
     DB_NAME = os.getenv("DB_NAME")
-    db_url = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode=disable"
+    db_url = os.getenv("DATABASE_URL1")
 
 db_url = ensure_sslmode_require(db_url)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
