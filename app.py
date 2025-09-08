@@ -1,13 +1,16 @@
 import os
 import re
-import cv2
-import numpy as np
+import threading
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
+import numpy as np
+import cv2
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 from model import db, User, FaceEmbedding, DetectedFace, OtpCode
 from email_utils import init_mail, send_otp_email, verify_otp
+
 
 # -----------------------------
 # Flask app & basic config
@@ -22,11 +25,24 @@ QUERY_DIR = os.path.join(BASE_DIR, "queries")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(QUERY_DIR, exist_ok=True)
 
+
 # -----------------------------
 # Database (use Heroku DATABASE_URL if present)
 # -----------------------------
+def ensure_sslmode_require(url: str) -> str:
+    """Force sslmode=require for Postgres connections unless explicitly set."""
+    parsed = urlparse(url)
+    q = dict(parse_qsl(parsed.query))
+    if parsed.scheme.startswith("postgres") and q.get("sslmode") is None:
+        q["sslmode"] = "require"
+        parsed = parsed._replace(query=urlencode(q))
+        return urlunparse(parsed)
+    return url
+
+
 db_url = os.getenv("DATABASE_URL")
 if db_url:
+    # Heroku can provide postgres:// – SQLAlchemy prefers postgresql://
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 else:
     # Optional local fallback via individual envs
@@ -34,11 +50,14 @@ else:
     DB_PASSWORD = os.getenv("DB_PASSWORD", "")
     DB_HOST = os.getenv("DB_HOST", "localhost")
     DB_PORT = os.getenv("DB_PORT", "5432")
-    DB_NAME = os.getenv("DB_NAME", "aiwatchman")
-    db_url = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    DB_NAME = os.getenv("DB_NAME")
+    db_url = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode=disable"
 
+db_url = ensure_sslmode_require(db_url)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+# Keep connections fresh across dyno sleeps
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
 
 # Mail (reads env: MAIL_SERVER, MAIL_PORT, MAIL_USE_TLS/SSL, MAIL_USERNAME, MAIL_PASSWORD, MAIL_DEFAULT_SENDER)
 init_mail(app)
@@ -48,24 +67,37 @@ db.init_app(app)
 with app.app_context():
     db.create_all()
 
+
 # -----------------------------
-# InsightFace (CPU only on Heroku)
+# InsightFace lazy loader (avoids Heroku boot timeouts)
 # -----------------------------
 # Cache models in a writable path; re-downloaded per dyno restart
 os.environ.setdefault("INSIGHTFACE_HOME", "/tmp/insightface")
 
-from insightface.app import FaceAnalysis  # noqa: E402 (import after setting env)
-
-face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-face_app.prepare(ctx_id=0, det_size=(640, 640))
+_face_app = None
+_face_lock = threading.Lock()
 
 
-def get_embeddings_from_image(img_path):
+def get_face_app():
+    """Initialize InsightFace on first use (thread-safe)."""
+    global _face_app
+    if _face_app is None:
+        with _face_lock:
+            if _face_app is None:
+                from insightface.app import FaceAnalysis  # heavy import, do it lazily
+                fa = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+                # CPU, detector size; adjust if you need speed vs. accuracy
+                fa.prepare(ctx_id=0, det_size=(640, 640))
+                _face_app = fa
+    return _face_app
+
+
+def get_embeddings_from_image(img_path: str):
     """Return a list of L2-normalized face embeddings (float32 lists)."""
     img = cv2.imread(img_path)
     if img is None:
         return []
-    faces = face_app.get(img)
+    faces = get_face_app().get(img)
     return [f.normed_embedding.astype("float32").tolist() for f in faces]
 
 
@@ -75,6 +107,13 @@ def get_embeddings_from_image(img_path):
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"message": "Hello, brother! Your API is working."}), 200
+
+
+@app.route("/warmup", methods=["GET"])
+def warmup():
+    """Trigger model init so subsequent requests are fast."""
+    _ = get_face_app()
+    return jsonify({"status": "ok", "message": "Model warmed"}), 200
 
 
 @app.route("/upload-references", methods=["POST"])
@@ -148,7 +187,7 @@ def identify_image():
                 best_score = score
                 best_name = entry.person
 
-        # threshold
+        # Threshold for recognition
         if best_score < 0.6:
             best_name = "unknown"
 
@@ -267,5 +306,11 @@ def login():
 # -----------------------------
 # Entrypoint
 # -----------------------------
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    # Heroku sets PORT; local default is 5000
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 5000)),
+        debug=True
+    )
