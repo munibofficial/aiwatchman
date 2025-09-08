@@ -13,9 +13,8 @@ def init_mail(app):
     app.config['MAIL_SERVER'] = "smtp.gmail.com"
     app.config['MAIL_PORT'] = 587
     app.config['MAIL_USE_TLS'] = True
-    app.config['MAIL_USERNAME'] = "arhumdoger@gmail.com"  # your Gmail address
-    app.config['MAIL_PASSWORD'] = "ovqz vtsx mnkn vlpt"     # your Gmail App Password
-
+    app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+    app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
     mail.init_app(app)
 
 def send_otp_email(to_email):
